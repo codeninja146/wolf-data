@@ -106,16 +106,24 @@ def download(symbols):
     raw = call_yahoo(lambda: yf.download(symbols, period="2y", interval="1d", group_by="ticker",
                                          auto_adjust=True, progress=False, threads=True), "price history")
     frames = {}
-    if raw is None or raw.empty:
-        return frames
-    for sym in symbols:
-        try:
-            df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+    if raw is not None and not raw.empty:
+        for sym in symbols:
+            try:
+                df = raw[sym] if isinstance(raw.columns, pd.MultiIndex) else raw
+                df = df.dropna(subset=["Close"])
+            except KeyError:
+                continue
+            if len(df) >= 2:
+                frames[sym] = df
+    for sym in [s for s in symbols if s not in frames]:  # Yahoo sometimes drops a ticker: retry alone
+        time.sleep(1)
+        df = call_yahoo(lambda s=sym: yf.Ticker(s).history(period="2y", interval="1d", auto_adjust=True),
+                        f"{sym} prices (retry)")
+        if df is not None and not df.empty:
             df = df.dropna(subset=["Close"])
-        except KeyError:
-            continue
-        if len(df) >= 2:
-            frames[sym] = df
+            if len(df) >= 2:
+                frames[sym] = df
+                log(f"   {sym}: recovered on retry")
     return frames
 
 
@@ -163,13 +171,17 @@ def earnings(ticker, df):
     if ed is None or getattr(ed, "empty", True):
         return out
     ed = ed.sort_index()
-    now = pd.Timestamp.now(tz="America/New_York")
-    upcoming = [ts for ts in ed.index if ts.date() >= TODAY]
+    now = pd.Timestamp(NOW)
+    if "Reported EPS" in ed.columns:
+        reported = list(ed["Reported EPS"].notna())
+    else:
+        reported = [ts < now for ts in ed.index]
+    # next report = first one from today on that hasn't reported yet (a report out today is "last", not "next")
+    upcoming = [ts for ts, done in zip(ed.index, reported) if ts.date() >= TODAY and not done]
     if upcoming:
         out["next_earnings"] = upcoming[0].date().isoformat()
         out["next_in_days"] = (upcoming[0].date() - TODAY).days
-    reported = ed["Reported EPS"].notna() if "Reported EPS" in ed.columns else pd.Series(True, index=ed.index)
-    past = ed[(ed.index < now) & reported.values]
+    past = ed[[bool(ts < now and done) for ts, done in zip(ed.index, reported)]]
     if past.empty:
         return out
     ts, row = past.index[-1], past.iloc[-1]
